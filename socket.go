@@ -136,6 +136,8 @@ func (s *Socket) Init() (err error) {
 		return fmt.Errorf("first message error: %w", err)
 	}
 
+  s.generateSessionID()
+
 	if err = s.sendConnectionSetupMessages(); err != nil {
 		s.onError(err, ConnectionSetupMessagesErrorContext)
 		s.scheduleReconnect()
@@ -212,6 +214,10 @@ func (s *Socket) checkFirstReceivedMessage() error {
 
 	s.sessionID = string(payload)
 	return nil
+}
+
+func (s *Socket) generateSessionID() {
+	s.sessionID = "qs_" + GetRandomString(12)
 }
 
 func (s *Socket) sendConnectionSetupMessages() error {
