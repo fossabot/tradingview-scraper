@@ -71,7 +71,10 @@ func (s *Socket) Close() (err error) {
 // AddSymbol ...
 func (s *Socket) AddSymbol(symbol string) (err error) {
 	err = s.sendSocketMessage(
-		getSocketMessage("quote_add_symbols", []interface{}{s.sessionID, symbol, getFlags()}),
+		// TODO: conduct further investgations and refactor the code;
+		// this change was suggested in issue: https://github.com/marcos-gonalons/tradingview-scraper/issues/8
+		// in order to avoid `closed network connection` errors
+		getSocketMessage("quote_add_symbols", []interface{}{s.sessionID, symbol}),
 	)
 	return
 }
