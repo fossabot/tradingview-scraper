@@ -1,5 +1,7 @@
 package tradingview
 
+import "time"
+
 // SocketInterface ...
 type SocketInterface interface {
 	AddSymbol(symbol string) error
@@ -23,10 +25,13 @@ type QuoteMessage struct {
 
 // QuoteData ...
 type QuoteData struct {
-	Price  *float64 `mapstructure:"lp"`
-	Volume *float64 `mapstructure:"volume"`
-	Bid    *float64 `mapstructure:"bid"`
-	Ask    *float64 `mapstructure:"ask"`
+	Date   time.Time `json:"date"`
+	Symbol string    `json:"symbol"`
+	Source string    `json:"source"`
+	Price  *float64  `json:"price" mapstructure:"lp"`
+	Volume *float64  `json:"volume" mapstructure:"volume"`
+	Bid    *float64  `json:"bid" mapstructure:"bid"`
+	Ask    *float64  `json:"ask" mapstructure:"ask"`
 }
 
 // Flags ...
@@ -35,7 +40,7 @@ type Flags struct {
 }
 
 // OnReceiveDataCallback ...
-type OnReceiveDataCallback func(symbol string, data *QuoteData)
+type OnReceiveDataCallback func(quote *QuoteData)
 
 // OnErrorCallback ...
 type OnErrorCallback func(err error, context string)
