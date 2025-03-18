@@ -27,6 +27,7 @@ const (
 	PingErrorContext                       = "Sending ping request"
 	ReadTimeoutErrorContext                = "Read operation timed out"
 	ExtractPayloadErrorContext             = "Extracting payload from WebSocket message"
+	PingTimeoutErrorContext                = "Ping operation timed out"
 )
 
 const (
@@ -34,6 +35,7 @@ const (
 	maxReconnectAttempts  = 20
 	readTimeout           = 20 * time.Second
 	pingInterval          = 10 * time.Second
+	pingTimeout           = 30 * time.Second // Timeout for ping response
 	defaultBuildTime      = "2025_03_05-11_31"
 	defaultFromParam      = "/chart"
 	defaultConnectionType = "main"
@@ -54,16 +56,18 @@ type Socket struct {
 	buildTime      string
 	fromParam      string
 
-	sessionID      string
-	isClosed       bool
-	isConnecting   bool
-	reconnectCount int
-	messageQueue   []*SocketMessage
-	addedSymbols   map[string]struct{}
-	removedSymbols map[string]struct{}
-	pingInfo       PingInfo
-	pingTicker     *time.Ticker
-	done           chan struct{}
+	sessionID        string
+	isClosed         bool
+	isConnecting     bool
+	reconnectCount   int
+	messageQueue     []*SocketMessage
+	addedSymbols     map[string]struct{}
+	removedSymbols   map[string]struct{}
+	pingInfo         PingInfo
+	pingTicker       *time.Ticker
+	lastPingResponse time.Time
+	pingTimeoutTimer *time.Ticker
+	done             chan struct{}
 }
 
 // PingInfo holds latency statistics for ping requests
@@ -136,7 +140,7 @@ func (s *Socket) Init() (err error) {
 		return fmt.Errorf("first message error: %w", err)
 	}
 
-  s.generateSessionID()
+	s.generateSessionID()
 
 	if err = s.sendConnectionSetupMessages(); err != nil {
 		s.onError(err, ConnectionSetupMessagesErrorContext)
@@ -147,16 +151,6 @@ func (s *Socket) Init() (err error) {
 	go s.connectionLoop()
 	s.startPing()
 	return nil
-}
-
-// Close terminates the WebSocket connection
-func (s *Socket) Close() (err error) {
-	s.isClosed = true
-	close(s.done)
-	if s.conn != nil {
-		err = s.conn.Close()
-	}
-	return
 }
 
 // AddSymbol subscribes to updates for a symbol
@@ -370,22 +364,40 @@ func (s *Socket) scheduleReconnect() {
 	})
 }
 
+// Modified startPing function
 func (s *Socket) startPing() {
 	s.pingTicker = time.NewTicker(pingInterval)
+	s.pingTimeoutTimer = time.NewTicker(pingTimeout)
+	s.lastPingResponse = time.Now()
+
 	go func() {
 		for {
 			select {
 			case <-s.pingTicker.C:
-				s.sendPing()
+				if err := s.sendPing(); err != nil {
+					s.onError(err, PingErrorContext)
+					// Continue trying - don't stop the ticker
+				} else {
+					s.lastPingResponse = time.Now()
+				}
+			case <-s.pingTimeoutTimer.C:
+				if time.Since(s.lastPingResponse) > pingTimeout {
+					timeoutErr := errors.New("ping timeout exceeded")
+					s.onError(timeoutErr, PingTimeoutErrorContext)
+					s.Close() // Close connection on timeout
+					return
+				}
 			case <-s.done:
 				s.pingTicker.Stop()
+				s.pingTimeoutTimer.Stop()
 				return
 			}
 		}
 	}()
 }
 
-func (s *Socket) sendPing() {
+// Modified sendPing function to return error
+func (s *Socket) sendPing() error {
 	start := time.Now()
 	host := s.selectHost()
 	url := fmt.Sprintf("https://%s/ping", host)
@@ -393,9 +405,15 @@ func (s *Socket) sendPing() {
 	resp, err := http.Get(url)
 	if err != nil {
 		s.onError(err, PingErrorContext)
-		return
+		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("ping request failed with status code: %d", resp.StatusCode)
+		s.onError(err, PingErrorContext)
+		return err
+	}
 
 	latency := time.Since(start)
 
@@ -414,6 +432,24 @@ func (s *Socket) sendPing() {
 	s.pingInfo.Count++
 	total := s.pingInfo.Avg*float64(s.pingInfo.Count-1) + float64(latency)
 	s.pingInfo.Avg = total / float64(s.pingInfo.Count)
+
+	return nil
+}
+
+// Modified Close function to also stop ping timers
+func (s *Socket) Close() (err error) {
+	s.isClosed = true
+	close(s.done)
+	if s.pingTicker != nil {
+		s.pingTicker.Stop()
+	}
+	if s.pingTimeoutTimer != nil {
+		s.pingTimeoutTimer.Stop()
+	}
+	if s.conn != nil {
+		err = s.conn.Close()
+	}
+	return
 }
 
 func (s *Socket) selectHost() string {
