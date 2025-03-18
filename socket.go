@@ -27,13 +27,17 @@ const (
 	PingErrorContext                       = "Sending ping request"
 	ReadTimeoutErrorContext                = "Read operation timed out"
 	ExtractPayloadErrorContext             = "Extracting payload from WebSocket message"
+	PingTimeoutErrorContext                = "Ping operation timed out"
+	WebSocketPingErrorContext              = "WebSocket ping frame sending failed"
 )
 
 const (
 	defaultReconnectDelay = 5 * time.Second
 	maxReconnectAttempts  = 20
+	pingTimeout           = 30 * time.Second // Timeout for WebSocket ping response
 	readTimeout           = 20 * time.Second
 	pingInterval          = 10 * time.Second
+	writeWait             = 10 * time.Second
 	defaultBuildTime      = "2025_03_05-11_31"
 	defaultFromParam      = "/chart"
 	defaultConnectionType = "main"
@@ -54,16 +58,17 @@ type Socket struct {
 	buildTime      string
 	fromParam      string
 
-	sessionID      string
-	isClosed       bool
-	isConnecting   bool
-	reconnectCount int
-	messageQueue   []*SocketMessage
-	addedSymbols   map[string]struct{}
-	removedSymbols map[string]struct{}
-	pingInfo       PingInfo
-	pingTicker     *time.Ticker
-	done           chan struct{}
+	sessionID        string
+	isClosed         bool
+	isConnecting     bool
+	reconnectCount   int
+	messageQueue     []*SocketMessage
+	addedSymbols     map[string]struct{}
+	removedSymbols   map[string]struct{}
+	pingInfo         PingInfo
+	pingTicker       *time.Ticker
+	lastPingResponse time.Time
+	done             chan struct{}
 }
 
 // PingInfo holds latency statistics for ping requests
@@ -123,11 +128,21 @@ func (s *Socket) Init() (err error) {
 	defer func() { s.isConnecting = false }()
 
 	wsURL := s.getWebSocketURL()
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, getHeaders())
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	s.conn, _, err = dialer.Dial(wsURL, getHeaders())
 	if err != nil {
 		s.onError(err, InitErrorContext)
 		s.scheduleReconnect()
 		return fmt.Errorf("connection failed: %w", err)
+	}
+
+	// Set initial read deadline
+	if err = s.conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		s.onError(err, SetReadDeadlineErrorContext)
+		s.scheduleReconnect()
+		return fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
 	if err = s.checkFirstReceivedMessage(); err != nil {
@@ -135,6 +150,8 @@ func (s *Socket) Init() (err error) {
 		s.scheduleReconnect()
 		return fmt.Errorf("first message error: %w", err)
 	}
+
+	s.generateSessionID()
 
 	if err = s.sendConnectionSetupMessages(); err != nil {
 		s.onError(err, ConnectionSetupMessagesErrorContext)
@@ -145,16 +162,6 @@ func (s *Socket) Init() (err error) {
 	go s.connectionLoop()
 	s.startPing()
 	return nil
-}
-
-// Close terminates the WebSocket connection
-func (s *Socket) Close() (err error) {
-	s.isClosed = true
-	close(s.done)
-	if s.conn != nil {
-		err = s.conn.Close()
-	}
-	return
 }
 
 // AddSymbol subscribes to updates for a symbol
@@ -212,6 +219,10 @@ func (s *Socket) checkFirstReceivedMessage() error {
 
 	s.sessionID = string(payload)
 	return nil
+}
+
+func (s *Socket) generateSessionID() {
+	s.sessionID = "qs_" + GetRandomString(12)
 }
 
 func (s *Socket) sendConnectionSetupMessages() error {
@@ -364,32 +375,78 @@ func (s *Socket) scheduleReconnect() {
 	})
 }
 
+// Modified startPing function
 func (s *Socket) startPing() {
 	s.pingTicker = time.NewTicker(pingInterval)
+	s.lastPingResponse = time.Now()
+
+	// Setup WebSocket pong handler
+	s.conn.SetPongHandler(func(string) error {
+		s.lastPingResponse = time.Now()
+		return nil
+	})
+
 	go func() {
+		defer s.pingTicker.Stop()
+
 		for {
 			select {
 			case <-s.pingTicker.C:
-				s.sendPing()
+				// Send WebSocket ping frame
+				if err := s.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
+					s.onError(err, WebSocketPingErrorContext)
+					s.Close()
+					return
+				}
+
+				// Also send HTTP ping for latency stats
+				if err := s.sendPing(); err != nil {
+					s.onError(err, PingErrorContext)
+					// Continue trying for HTTP ping - don't stop for this
+				}
+
+				// Check if we've exceeded timeout since last pong
+				if time.Since(s.lastPingResponse) > pingTimeout {
+					timeoutErr := errors.New("websocket ping timeout exceeded")
+					s.onError(timeoutErr, PingTimeoutErrorContext)
+					s.Close() // Close connection on timeout
+					return
+				}
 			case <-s.done:
-				s.pingTicker.Stop()
 				return
 			}
 		}
 	}()
 }
 
-func (s *Socket) sendPing() {
+// Modified sendPing function to return error - this is for HTTP ping for stats only
+func (s *Socket) sendPing() error {
+	if s.conn == nil || s.isClosed {
+		return errors.New("connection closed or not initialized")
+	}
+
 	start := time.Now()
 	host := s.selectHost()
 	url := fmt.Sprintf("https://%s/ping", host)
 
-	resp, err := http.Get(url)
+	// Use a client with timeout
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(url)
 	if err != nil {
+		// Just log but don't close connection - this is just for stats
 		s.onError(err, PingErrorContext)
-		return
+		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("ping request failed with status code: %d", resp.StatusCode)
+		s.onError(err, PingErrorContext)
+		return err
+	}
 
 	latency := time.Since(start)
 
@@ -408,6 +465,30 @@ func (s *Socket) sendPing() {
 	s.pingInfo.Count++
 	total := s.pingInfo.Avg*float64(s.pingInfo.Count-1) + float64(latency)
 	s.pingInfo.Avg = total / float64(s.pingInfo.Count)
+
+	return nil
+}
+
+// Modified Close function to also stop ping timers
+func (s *Socket) Close() (err error) {
+	if s.isClosed {
+		return nil
+	}
+
+	s.isClosed = true
+	close(s.done)
+	if s.pingTicker != nil {
+		s.pingTicker.Stop()
+	}
+	if s.conn != nil {
+		// Try to send close message
+		deadline := time.Now().Add(writeWait)
+		s.conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			deadline)
+		err = s.conn.Close()
+	}
+	return
 }
 
 func (s *Socket) selectHost() string {
